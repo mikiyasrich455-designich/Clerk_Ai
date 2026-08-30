@@ -1,6 +1,149 @@
 {
   "log": [
     {
+      "query": "find me best phone under 500$ for gamin",
+      "category": "find me best phone under 500$ for gamin",
+      "matched": 6,
+      "products": [
+        "Nothing Phone Pro",
+        "Google Pixel 10 Pro XL",
+        "Samsung Galaxy S26"
+      ],
+      "live": true,
+      "ts": 1788089619,
+      "id": "42"
+    },
+    {
+      "query": "wireless headphones under 50 dollars",
+      "category": "wireless headphones under 50 dollars",
+      "matched": 6,
+      "products": [
+        "Skullcandy Icon 180 On Ear Headphones",
+        "Cowin Active Noise Canceling Headphones Headband Wireless Bluetooth Headset with ENC Mic",
+        "Tzumi Soundplay Wireless Over Ear Headphones"
+      ],
+      "live": true,
+      "ts": 1788087904,
+      "id": "41"
+    },
+    {
+      "query": "wireless headphones under 50 dollars",
+      "category": "wireless headphones under 50 dollars",
+      "matched": 6,
+      "products": [
+        "Skullcandy Icon 180 On Ear Headphones",
+        "Cowin Active Noise Canceling Headphones Headband Wireless Bluetooth Headset with ENC Mic",
+        "Tzumi Soundplay Wireless Over Ear Headphones"
+      ],
+      "live": true,
+      "ts": 1788087870,
+      "id": "40"
+    },
+    {
+      "query": "wireless headphones under 50 dollars",
+      "category": "wireless headphones under 50 dollars",
+      "matched": 6,
+      "products": [
+        "Skullcandy Icon 180 On Ear Headphones",
+        "Cowin Active Noise Canceling Headphones Headband Wireless Bluetooth Headset with ENC Mic",
+        "Tzumi Soundplay Wireless Over Ear Headphones"
+      ],
+      "live": true,
+      "ts": 1788087841,
+      "id": "39"
+    },
+    {
+      "query": "wireless headphones under 50 dollars",
+      "category": "wireless headphones under 50 dollars",
+      "matched": 6,
+      "products": [
+        "Skullcandy Icon 180 On Ear Headphones",
+        "Cowin Active Noise Canceling Headphones Headband Wireless Bluetooth Headset with ENC Mic",
+        "Tzumi Soundplay Wireless Over Ear Headphones"
+      ],
+      "live": true,
+      "ts": 1788087800,
+      "id": "38"
+    },
+    {
+      "query": "wireless headphones under 50 dollars",
+      "category": "wireless headphones under 50 dollars",
+      "matched": 6,
+      "products": [
+        "Skullcandy Icon 180 On Ear Headphones",
+        "Cowin Active Noise Canceling Headphones Headband Wireless Bluetooth Headset with ENC Mic",
+        "Tzumi Soundplay Wireless Over Ear Headphones"
+      ],
+      "live": true,
+      "ts": 1788086794,
+      "id": "37"
+    },
+    {
+      "query": "wireless headphones under 50 dollars",
+      "category": "wireless headphones under 50 dollars",
+      "matched": 6,
+      "products": [
+        "Skullcandy Icon 180 On Ear Headphones",
+        "Cowin Active Noise Canceling Headphones Headband Wireless Bluetooth Headset with ENC Mic",
+        "Tzumi Soundplay Wireless Over Ear Headphones"
+      ],
+      "live": true,
+      "ts": 1788086634,
+      "id": "36"
+    },
+    {
+      "query": "wireless headphones under 50 dollars",
+      "category": "wireless headphones",
+      "matched": 6,
+      "products": [
+        "Cowin Active Noise Canceling Headphones Headband Wireless Bluetooth Headset with ENC Mic",
+        "Skullcandy Icon 180 On Ear Headphones",
+        "Tzumi Soundplay Wireless Over Ear Headphones"
+      ],
+      "live": true,
+      "ts": 1788086376,
+      "id": "35"
+    },
+    {
+      "query": "give me best pc for 200$",
+      "category": "PC",
+      "matched": 6,
+      "products": [
+        "Dell Optiplex 3040 Desktop Computer Intel i5-6500 16gb Ddr3 RAM",
+        "HP RGB Gaming Desktop Computer PC Intel i5 NVIDIA GeForce 730 3.00-3.49GHz 16GB RAM 2TB HDD Windows 11 WIFI | Small Form Factor | Optical Drive",
+        "HP Slim Desktop Intel Pentium Silver J5040 Processor 8 GB Ddr4-2400 Sdram Memory"
+      ],
+      "live": true,
+      "ts": 1788086184,
+      "id": "34"
+    },
+    {
+      "query": "I need a silk dress for a wedding under $150",
+      "category": "silk dress",
+      "matched": 6,
+      "products": [
+        "Women's Loft Versa Satin Maxi Slip Dress",
+        "Women's Quince Maxi Slip Dress",
+        "Petal & Pup Women's Dresses Petal Pup Vikki Dress"
+      ],
+      "live": true,
+      "ts": 1788085845,
+      "id": "33"
+    },
+    {
+      "query": "wireless headphones under 50 dollars",
+      "category": "wireless headphones",
+      "matched": 6,
+      "products": [
+        "JBL On-Ear Headphones Tune 520BT Wireless",
+        "Jacenvly 2024 New Earphones Wireless Bluetooth Stereo Earphone Headset Wireless Magnetic In-Ear Earbuds Headphone Wireless Headphones Silver, Size:",
+        "Philips On-Ear Wireless Headphones"
+      ],
+      "live": true,
+      "ts": 1788085786,
+      "id": "32"
+    },
+    {
       "query": "find me lenovo laptop aroound 500$",
       "category": "Best Buy",
       "matched": 6,

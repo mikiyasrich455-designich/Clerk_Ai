@@ -93,11 +93,11 @@ function render(reply, products, sources, offline=false){
 async function research(){const q=document.getElementById('question').value.trim();if(!q)return;const btn=document.getElementById('research');btn.disabled=true;btn.textContent='Researching…';
 document.getElementById('output').innerHTML='';
 updateSteps(1);
-setTimeout(()=>updateSteps(2),600);
-setTimeout(()=>updateSteps(3),2000);
 try{const ctl=new AbortController();const to=setTimeout(()=>ctl.abort(),35000);const r=await fetch(API_BASE+'/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:q}),signal:ctl.signal});clearTimeout(to);
+if(!r.ok){ const txt=await r.text(); throw Error(txt); }const d=await r.json();
+(d.trace||[]).forEach(t=>{const m={understand:1,plan:2,act:2,decide:3,verify:4};updateSteps(m[t.step]||1);});
 updateSteps(4);
-if(!r.ok){ const txt=await r.text(); throw Error(txt); }const d=await r.json();render(d.reply||d.fallback,d.products,d.sources,false);setStatus('Research complete. Results grounded in real evidence.')}catch(e){const matches=localMatch(q);const reply=matches.length?`Based on Mika's Threads catalog, these are the strongest matches for “${q}”. I included stock, sizes, and the store price so you can decide with confidence.`:`I could not find an exact match for “${q}” in the local catalog. Try a product type such as dress, trousers, scarf, or sneaker.`;render(reply,matches,[],true);setStatus('Could not reach the API. Run the backend (python -m uvicorn backend:app --port 8010) or deploy to Vercel for live results.')}finally{btn.disabled=false;btn.textContent='Research this →'}}
+render(d.reply||d.fallback,d.products,d.sources,false);setStatus('Research complete. Results grounded in real evidence.')}catch(e){const matches=localMatch(q);const reply=matches.length?`Based on Mika's Threads catalog, these are the strongest matches for “${q}”. I included stock, sizes, and the store price so you can decide with confidence.`:`I could not find an exact match for “${q}” in the local catalog. Try a product type such as dress, trousers, scarf, or sneaker.`;render(reply,matches,[],true);setStatus('Could not reach the API. Run the backend (python -m uvicorn backend:app --port 8010) or deploy to Vercel for live results.')}finally{btn.disabled=false;btn.textContent='Research this →'}}
 document.getElementById('question').addEventListener('keydown',e=>{if(e.key==='Enter')research()});
 fetch(API_BASE+'/api/catalog').then(r=>r.ok?r.json():Promise.reject()).then(d=>{if(d.products?.length)catalog=d.products}).catch(()=>{});
 </script>

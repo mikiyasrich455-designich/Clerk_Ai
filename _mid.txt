@@ -1,0 +1,130 @@
+   1: """
+   2: CartSaver (Clerk) backend — FastAPI.
+   3: 
+   4: One-store merchant assistant: a shopper chat agent that reads the store's
+   5: catalog, answers product questions with real web prices (SERP), and logs
+   6: shopper-intent insights for the merchant dashboard.
+   7: 
+   8: Endpoints:
+   9:     GET  /api/health            -> {ok: true}
+  10:     GET  /api/catalog           -> full product catalog
+  11:     POST /api/chat              -> {reply, products[], sources[], insight}
+  12:     POST /api/search            -> live web price search (SERP + Groq)
+  13:     GET  /api/insights          -> aggregated shopper insights for dashboard
+  14: 
+  15: LLM: Groq (qwen/qwen3.8-27b). Live prices: SERP Google search.
+  16: State is JSON files (hackathon scope — no DB, no cloud).
+  17: """
+  18: import concurrent.futures
+  19: import json
+  20: import os
+  21: import threading
+  22: import time
+  23: import urllib.parse
+  24: import urllib.request
+  25: 
+  26: from fastapi import FastAPI, Body
+  27: from fastapi.middleware.cors import CORSMiddleware
+  28: from fastapi.responses import JSONResponse
+  29: from fastapi.staticfiles import StaticFiles
+  30: 
+  31: # ---------------------------------------------------------------------------
+  32: # Config
+  33: # ---------------------------------------------------------------------------
+  34: REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+  35: CATALOG_PATH = os.path.join(REPO_ROOT, "catalog.json")
+  36: INSIGHTS_PATH = os.path.join(REPO_ROOT, "insights.json")
+  37: 
+  38: GROQ_KEY = os.environ.get("GROQ_API_KEY") or "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"
+  39: SERP_KEY = os.environ.get("SERP_API_KEY") or "3e1ade6589e27599aee2edc05661ece71be4fa47235bc703a63b937e573d0b8b"
+  40: GROQ_MODEL = "qwen/qwen3.8-27b"
+  41: GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+  42: SERP_URL = "https://serpapi.com/search?engine=google"
+  43: 
+  44: UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+  45: 
+  46: app = FastAPI(title="CartSaver Clerk")
+  47: app.add_middleware(
+  48:     CORSMiddleware,
+  49:     allow_origins=["null", "http://127.0.0.1:8010", "http://localhost:8010"],
+  50:     allow_credentials=False,
+  51:     allow_methods=["GET", "POST", "OPTIONS"],
+  52:     allow_headers=["*"],
+  53: )
+  54: 
+  55: 
+  56: # ---------------------------------------------------------------------------
+  57: # Data helpers
+  58: # ---------------------------------------------------------------------------
+  59: def _read_json(path, default):
+  60:     try:
+  61:         with open(path, "r", encoding="utf-8") as f:
+  62:             return json.load(f)
+  63:     except (FileNotFoundError, json.JSONDecodeError):
+  64:         return default
+  65: 
+  66: 
+  67: def _write_json(path, data):
+  68:     with open(path, "w", encoding="utf-8") as f:
+  69:         json.dump(data, f, indent=2, ensure_ascii=False)
+  70: 
+  71: 
+  72: def _catalog():
+  73:     return _read_json(CATALOG_PATH, {"products": []})
+  74: 
+  75: 
+  76: def _insights():
+  77:     return _read_json(INSIGHTS_PATH, {"log": []})
+  78: 
+  79: 
+  80: def _log_insight(entry):
+  81:     data = _insights()
+  82:     entry["ts"] = int(time.time())
+  83:     entry["id"] = str(len(data["log"]) + 1)
+  84:     data["log"].insert(0, entry)
+  85:     data["log"] = data["log"][:200]
+  86:     _write_json(INSIGHTS_PATH, data)
+  87: 
+  88: 
+  89: # ---------------------------------------------------------------------------
+  90: # LLM + web search
+  91: # ---------------------------------------------------------------------------
+  92: def _groq(messages, max_tokens=600, temperature=0.4, json_mode=False):
+  93:     """Call Groq. Returns text or None on failure."""
+  94:     if not GROQ_KEY:
+  95:         raise RuntimeError("GROQ_API_KEY is not configured")
+  96:     body = {
+  97:         "model": GROQ_MODEL,
+  98:         "messages": messages,
+  99:         "max_tokens": max_tokens,
+ 100:         "temperature": temperature,
+ 101:     }
+ 102:     if json_mode:
+ 103:         body["response_format"] = {"type": "json_object"}
+ 104:     req = urllib.request.Request(
+ 105:         GROQ_URL,
+ 106:         data=json.dumps(body).encode("utf-8"),
+ 107:         headers={
+ 108:             "Content-Type": "application/json",
+ 109:             "Authorization": "Bearer " + GROQ_KEY,
+ 110:             "User-Agent": UA,
+ 111:         },
+ 112:         method="POST",
+ 113:     )
+ 114:     with urllib.request.urlopen(req, timeout=15) as r:
+ 115:         d = json.loads(r.read().decode("utf-8"))
+ 116:     return d["choices"][0]["message"]["content"].strip()
+ 117: 
+ 118: 
+ 119: def _groq_json(messages, max_tokens=800):
+ 120:     """Call Groq and parse a JSON object, tolerating markdown code fences."""
+ 121:     text = _groq(messages, max_tokens=max_tokens, temperature=0.3, json_mode=True)
+ 122:     if not text:
+ 123:         return None
+ 124:     text = text.strip()
+ 125:     if text.startswith("```"):
+ 126:         text = text.split("\n", 1)[-1]
+ 127:         if text.rstrip().endswith("```"):
+ 128:             text = text.rstrip()[:-3]
+ 129:         text = text.strip()
+ 130:     try:

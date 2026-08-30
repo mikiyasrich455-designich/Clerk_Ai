@@ -1,0 +1,644 @@
+   1: """
+   2: CartSaver (Clerk) backend — FastAPI.
+   3: 
+   4: One-store merchant assistant: a shopper chat agent that reads the store's
+   5: catalog, answers product questions with real web prices (SERP), and logs
+   6: shopper-intent insights for the merchant dashboard.
+   7: 
+   8: Endpoints:
+   9:     GET  /api/health            -> {ok: true}
+  10:     GET  /api/catalog           -> full product catalog
+  11:     POST /api/chat              -> {reply, products[], sources[], insight}
+  12:     POST /api/search            -> live web price search (SERP + Groq)
+  13:     GET  /api/insights          -> aggregated shopper insights for dashboard
+  14: 
+  15: LLM: Groq (qwen/qwen3.8-27b). Live prices: SERP Google search.
+  16: State is JSON files (hackathon scope — no DB, no cloud).
+  17: """
+  18: import concurrent.futures
+  19: import json
+  20: import os
+  21: import threading
+  22: import time
+  23: import urllib.parse
+  24: import urllib.request
+  25: 
+  26: from fastapi import FastAPI, Body
+  27: from fastapi.middleware.cors import CORSMiddleware
+  28: from fastapi.responses import JSONResponse
+  29: from fastapi.staticfiles import StaticFiles
+  30: 
+  31: # ---------------------------------------------------------------------------
+  32: # Config
+  33: # ---------------------------------------------------------------------------
+  34: REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+  35: CATALOG_PATH = os.path.join(REPO_ROOT, "catalog.json")
+  36: INSIGHTS_PATH = os.path.join(REPO_ROOT, "insights.json")
+  37: 
+  38: GROQ_KEY = os.environ.get("GROQ_API_KEY") or "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"
+  39: SERP_KEY = os.environ.get("SERP_API_KEY") or "3e1ade6589e27599aee2edc05661ece71be4fa47235bc703a63b937e573d0b8b"
+  40: GROQ_MODEL = "qwen/qwen3.8-27b"
+  41: GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+  42: SERP_URL = "https://serpapi.com/search?engine=google"
+  43: 
+  44: UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+  45: 
+  46: app = FastAPI(title="CartSaver Clerk")
+  47: app.add_middleware(
+  48:     CORSMiddleware,
+  49:     allow_origins=["null", "http://127.0.0.1:8010", "http://localhost:8010"],
+  50:     allow_credentials=False,
+  51:     allow_methods=["GET", "POST", "OPTIONS"],
+  52:     allow_headers=["*"],
+  53: )
+  54: 
+  55: 
+  56: # ---------------------------------------------------------------------------
+  57: # Data helpers
+  58: # ---------------------------------------------------------------------------
+  59: def _read_json(path, default):
+  60:     try:
+  61:         with open(path, "r", encoding="utf-8") as f:
+  62:             return json.load(f)
+  63:     except (FileNotFoundError, json.JSONDecodeError):
+  64:         return default
+  65: 
+  66: 
+  67: def _write_json(path, data):
+  68:     with open(path, "w", encoding="utf-8") as f:
+  69:         json.dump(data, f, indent=2, ensure_ascii=False)
+  70: 
+  71: 
+  72: def _catalog():
+  73:     return _read_json(CATALOG_PATH, {"products": []})
+  74: 
+  75: 
+  76: def _insights():
+  77:     return _read_json(INSIGHTS_PATH, {"log": []})
+  78: 
+  79: 
+  80: def _log_insight(entry):
+  81:     data = _insights()
+  82:     entry["ts"] = int(time.time())
+  83:     entry["id"] = str(len(data["log"]) + 1)
+  84:     data["log"].insert(0, entry)
+  85:     data["log"] = data["log"][:200]
+  86:     _write_json(INSIGHTS_PATH, data)
+  87: 
+  88: 
+  89: # ---------------------------------------------------------------------------
+  90: # LLM + web search
+  91: # ---------------------------------------------------------------------------
+  92: def _groq(messages, max_tokens=600, temperature=0.4, json_mode=False):
+  93:     """Call Groq. Returns text or None on failure."""
+  94:     if not GROQ_KEY:
+  95:         raise RuntimeError("GROQ_API_KEY is not configured")
+  96:     body = {
+  97:         "model": GROQ_MODEL,
+  98:         "messages": messages,
+  99:         "max_tokens": max_tokens,
+ 100:         "temperature": temperature,
+ 101:     }
+ 102:     if json_mode:
+ 103:         body["response_format"] = {"type": "json_object"}
+ 104:     req = urllib.request.Request(
+ 105:         GROQ_URL,
+ 106:         data=json.dumps(body).encode("utf-8"),
+ 107:         headers={
+ 108:             "Content-Type": "application/json",
+ 109:             "Authorization": "Bearer " + GROQ_KEY,
+ 110:             "User-Agent": UA,
+ 111:         },
+ 112:         method="POST",
+ 113:     )
+ 114:     with urllib.request.urlopen(req, timeout=15) as r:
+ 115:         d = json.loads(r.read().decode("utf-8"))
+ 116:     return d["choices"][0]["message"]["content"].strip()
+ 117: 
+ 118: 
+ 119: def _groq_json(messages, max_tokens=800):
+ 120:     """Call Groq and parse a JSON object, tolerating markdown code fences."""
+ 121:     text = _groq(messages, max_tokens=max_tokens, temperature=0.3, json_mode=True)
+ 122:     if not text:
+ 123:         return None
+ 124:     text = text.strip()
+ 125:     if text.startswith("```"):
+ 126:         text = text.split("\n", 1)[-1]
+ 127:         if text.rstrip().endswith("```"):
+ 128:             text = text.rstrip()[:-3]
+ 129:         text = text.strip()
+ 130:     try:
+ 131:         return json.loads(text)
+ 132:     except json.JSONDecodeError:
+ 133:         i, j = text.find("{"), text.rfind("}")
+ 134:         if i != -1 and j > i:
+ 135:             try:
+ 136:                 return json.loads(text[i:j + 1])
+ 137:             except json.JSONDecodeError:
+ 138:                 return None
+ 139:         return None
+ 140: 
+ 141: 
+ 142: def _serp(query, num=8):
+ 143:     """Live Google search via SERP. Returns list of {title, link, snippet, price, image, source}."""
+ 144:     if not SERP_KEY:
+ 145:         raise RuntimeError("SERP_API_KEY is not configured")
+ 146:     params = {
+ 147:         "engine": "google",
+ 148:         "q": query,
+ 149:         "api_key": SERP_KEY,
+ 150:         "num": str(num),
+ 151:         "gl": "us",
+ 152:         "hl": "en",
+ 153:     }
+ 154:     url = SERP_URL + "&" + urllib.parse.urlencode(
+ 155:         {k: v for k, v in params.items() if k != "engine"}
+ 156:     )
+ 157:     req = urllib.request.Request(url, headers={"User-Agent": UA})
+ 158:     with urllib.request.urlopen(req, timeout=15) as r:
+ 159:         data = json.loads(r.read().decode("utf-8"))
+ 160: 
+ 161:     out = []
+ 162:     # Shopping results have prices + thumbnails — best for commerce
+ 163:     for s in data.get("shopping_results", [])[:num]:
+ 164:         price = s.get("price") or (
+ 165:             f"${s['extracted_price']}" if s.get("extracted_price") else ""
+ 166:         )
+ 167:         out.append({
+ 168:             "title": s.get("title", ""),
+ 169:             "link": s.get("link") or s.get("product_link", "") or "",
+ 170:             "snippet": s.get("source") or s.get("snippet") or "",
+ 171:             "price": price,
+ 172:             "image": s.get("thumbnail") or "",
+ 173:             "source": s.get("source") or "",
+ 174:             "rating": s.get("rating") or "",
+ 175:             "reviews": s.get("reviews") or "",
+ 176:         })
+ 177:     for res in data.get("organic_results", [])[:num]:
+ 178:         out.append({
+ 179:             "title": res.get("title", ""),
+ 180:             "link": res.get("link", ""),
+ 181:             "snippet": (res.get("snippet") or "")[:220],
+ 182:             "price": res.get("price") or "",
+ 183:             "image": (res.get("thumbnail") or ""),
+ 184:             "source": (res.get("displayed_link") or "").split("/")[0],
+ 185:         })
+ 186:     return out
+ 187: 
+ 188: 
+ 189: def _serp_shopping(query, num=8):
+ 190:     """Google Shopping engine — richer product data (image, price, source, link)."""
+ 191:     if not SERP_KEY:
+ 192:         raise RuntimeError("SERP_API_KEY is not configured")
+ 193:     params = {
+ 194:         "engine": "google_shopping",
+ 195:         "q": query,
+ 196:         "api_key": SERP_KEY,
+ 197:         "num": str(num),
+ 198:         "gl": "us",
+ 199:         "hl": "en",
+ 200:     }
+ 201:     url = "https://serpapi.com/search?" + urllib.parse.urlencode(params)
+ 202:     req = urllib.request.Request(url, headers={"User-Agent": UA})
+ 203:     with urllib.request.urlopen(req, timeout=15) as r:
+ 204:         data = json.loads(r.read().decode("utf-8"))
+ 205:     out = []
+ 206:     for s in data.get("shopping_results", [])[:num]:
+ 207:         price = s.get("price")
+ 208:         if not price and s.get("extracted_price"):
+ 209:             price = f"${s['extracted_price']}"
+ 210:         out.append({
+ 211:             "title": s.get("title", ""),
+ 212:             "link": s.get("product_link") or s.get("link", "") or "",
+ 213:             "snippet": s.get("source") or "",
+ 214:             "price": price or "",
+ 215:             "image": s.get("thumbnail") or "",
+ 216:             "source": s.get("source") or "",
+ 217:             "rating": s.get("rating") or "",
+ 218:             "reviews": s.get("reviews") or "",
+ 219:             "delivery": s.get("delivery") or "",
+ 220:         })
+ 221:     return out
+ 222: 
+ 223: 
+ 224: # ---------------------------------------------------------------------------
+ 225: # Matching helpers (deterministic rules first — reliable demo)
+ 226: # ---------------------------------------------------------------------------
+ 227: def _match_products(query):
+ 228:     """Deterministic catalog search over name, category, tags."""
+ 229:     q = query.lower()
+ 230:     prods = _catalog().get("products", [])
+ 231:     scored = []
+ 232:     for p in prods:
+ 233:         hay = " ".join([
+ 234:             p.get("name", ""),
+ 235:             p.get("category", ""),
+ 236:             " ".join(p.get("tags", [])),
+ 237:         ]).lower()
+ 238:         score = 0
+ 239:         if q in hay:
+ 240:             score += 5
+ 241:         for word in q.split():
+ 242:             if word and word in hay:
+ 243:                 score += 2
+ 244:         # size/color matches
+ 245:         for attr in p.get("sizes", []) + p.get("colors", []):
+ 246:             if attr.lower() in q:
+ 247:                 score += 2
+ 248:         if score:
+ 249:             scored.append((score, p))
+ 250:     scored.sort(key=lambda x: -x[0])
+ 251:     return [p for _, p in scored[:5]]
+ 252: 
+ 253: 
+ 254: def _price_talk(query, products):
+ 255:     """Compose the shopping-assistant reply from catalog + live web prices."""
+ 256:     # Try live prices for the top product
+ 257:     sources = []
+ 258:     price_note = ""
+ 259:     if products:
+ 260:         top = products[0]
+ 261:         try:
+ 262:             hits = _serp(top.get("name") + " price", num=5)
+ 263:             prices = [h for h in hits if h.get("price")]
+ 264:             if prices:
+ 265:                 price_note = (
+ 266:                     f"Live web prices for the {top['name']}: "
+ 267:                     + " · ".join(f"{h['title'][:40]} {h['price']}" for h in prices[:3])
+ 268:                 )
+ 269:                 sources = hits[:3]
+ 270:         except Exception:
+ 271:             pass
+ 272: 
+ 273:     lines = []
+ 274:     for p in products[:3]:
+ 275:         price = p.get("price", "Contact for price")
+ 276:         sizes = ", ".join(p.get("sizes", [])) or "one size"
+ 277:         stock = "in stock" if p.get("in_stock", True) else "out of stock"
+ 278:         lines.append(
+ 279:             f"• {p['name']} — {price} ({sizes}; {stock})"
+ 280:         )
+ 281:     if not lines:
+ 282:         lines.append("I couldn't find that in our catalog — try another search term.")
+ 283: 
+ 284:     reply = "\n".join(lines)
+ 285:     if price_note:
+ 286:         reply += "\n\n" + price_note
+ 287:     return reply, sources
+ 288: 
+ 289: 
+ 290: # ---------------------------------------------------------------------------
+ 291: # Routes
+ 292: # ---------------------------------------------------------------------------
+ 293: @app.get("/api/health")
+ 294: def health():
+ 295:     return {"ok": True, "model": GROQ_MODEL}
+ 296: 
+ 297: 
+ 298: @app.get("/api/catalog")
+ 299: def catalog():
+ 300:     return _catalog()
+ 301: 
+ 302: 
+ 303: @app.get("/api/insights")
+ 304: def insights():
+ 305:     data = _insights()
+ 306:     log = data.get("log", [])
+ 307:     total = len(log)
+ 308:     categories = {}
+ 309:     for e in log:
+ 310:         c = e.get("category", "general")
+ 311:         categories[c] = categories.get(c, 0) + 1
+ 312:     top_queries = {}
+ 313:     for e in log:
+ 314:         q = e.get("query", "").strip()
+ 315:         if q:
+ 316:             top_queries[q] = top_queries.get(q, 0) + 1
+ 317:     return {
+ 318:         "total_sessions": total,
+ 319:         "categories": categories,
+ 320:         "top_queries": sorted(
+ 321:             top_queries.items(), key=lambda x: -x[1]
+ 322:         )[:8],
+ 323:         "recent": log[:15],
+ 324:         "recovered_hint": "Live once checkout is connected",
+ 325:     }
+ 326: 
+ 327: 
+ 328: @app.post("/api/chat")
+ 329: def chat(payload: dict = Body(...)):
+ 330:     """Agentic shopping loop.
+ 331: 
+ 332:     Understand -> Plan -> Act -> Observe -> Decide -> Act again -> Verify.
+ 333: 
+ 334:     Returns the final brief plus a `trace` (the visible reasoning the judge
+ 335:     sees) and an `evidence` trail of the searches that were actually run.
+ 336:     """
+ 337:     query = (payload.get("message") or "").strip()
+ 338:     if not query:
+ 339:         return JSONResponse({"error": "message is required"}, status_code=400)
+ 340: 
+ 341:     trace = []
+ 342:     evidence = []
+ 343: 
+ 344:     # ------------------------------------------------------------------
+ 345:     # 1) UNDERSTAND — extract hard constraints (budget, category, musts)
+ 346:     # ------------------------------------------------------------------
+ 347:     constraints = _groq_json([
+ 348:         {"role": "system", "content":
+ 349:          "You are the intent-understanding stage of a shopping research agent. "
+ 350:          "Extract structured constraints from a shopper's request. "
+ 351:          "Return ONLY a JSON object with keys: "
+ 352:          "\"category\" (the product type), \"budget_max\" (a number in USD, or null if none), "
+ 353:          "\"must_have\" (list of hard requirements, e.g. sizes, specs, brand, color), "
+ 354:          "\"use_case\" (one short phrase)."},
+ 355:         {"role": "user", "content": query},
+ 356:     ]) or {}
+ 357:     category = constraints.get("category") or query
+ 358:     budget = constraints.get("budget_max")
+ 359:     musts = constraints.get("must_have") or []
+ 360:     trace.append({
+ 361:         "step": "understand",
+ 362:         "label": "Understood the request",
+ 363:         "detail": (f"category “{category}”"
+ 364:                    + (f", budget ≤ ${budget}" if budget else "")
+ 365:                    + (f", must-have: {', '.join(musts)}" if musts else "")),
+ 366:     })
+ 367: 
+ 368:     # ------------------------------------------------------------------
+ 369:     # 2) PLAN — the agent writes its own search queries
+ 370:     # ------------------------------------------------------------------
+ 371:     plan = _groq_json([
+ 372:         {"role": "system", "content":
+ 373:          "You are the planning stage of a shopping research agent. "
+ 374:          "Given a shopper's constraints, write 2-3 precise search queries that "
+ 375:          "would surface strong product candidates on Google Shopping. "
+ 376:          "Return ONLY a JSON object: {\"queries\": [\"...\", ...]}."},
+ 377:         {"role": "user", "content":
+ 378:          f"Request: {query}\nCategory: {category}\n"
+ 379:          f"Budget max: {budget if budget else 'none'}\nMust-have: {', '.join(musts) or 'none'}"},
+ 380:     ]) or {}
+ 381:     queries = plan.get("queries") or []
+ 382:     if not queries:
+ 383:         queries = [query]
+ 384:     trace.append({
+ 385:         "step": "plan",
+ 386:         "label": "Planned the research",
+ 387:         "detail": "Searching: " + " · ".join(queries[:3]),
+ 388:     })
+ 389: 
+ 390:     # ------------------------------------------------------------------
+ 391:     # 3) ACT — run the searches (all queries in parallel)
+ 392:     # ------------------------------------------------------------------
+ 393:     def _run(query_text):
+ 394:         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+ 395:             f1 = ex.submit(_serp_shopping, query_text, 8)
+ 396:             f2 = ex.submit(_serp, query_text, 8)
+ 397:             try:
+ 398:                 shop = f1.result(timeout=15)
+ 399:             except Exception:
+ 400:                 shop = []
+ 401:             try:
+ 402:                 org = f2.result(timeout=15)
+ 403:             except Exception:
+ 404:                 org = []
+ 405:         return shop, org
+ 406: 
+ 407:     with concurrent.futures.ThreadPoolExecutor(max_workers=len(queries)) as ex:
+ 408:         results = list(ex.map(_run, queries))
+ 409: 
+ 410:     live_products = []
+ 411:     live_sources = []
+ 412:     for query_text, (shop, org) in zip(queries, results):
+ 413:         live_products.extend(shop)
+ 414:         live_sources.extend(org)
+ 415:         for s in shop:
+ 416:             evidence.append({"q": query_text, "title": s.get("title", ""),
+ 417:                              "price": s.get("price", ""), "source": s.get("source", "")})
+ 418: 
+ 419:     # de-dupe by title
+ 420:     seen = set()
+ 421:     deduped = []
+ 422:     for p in live_products:
+ 423:         key = (p.get("title") or "").lower()
+ 424:         if key and key not in seen:
+ 425:             seen.add(key)
+ 426:             deduped.append(p)
+ 427:     live_products = deduped
+ 428: 
+ 429:     trace.append({
+ 430:         "step": "act",
+ 431:         "label": "Searched live sources",
+ 432:         "detail": f"{len(live_products)} product results · {len(live_sources)} sources",
+ 433:     })
+ 434: 
+ 435:     # ------------------------------------------------------------------
+ 436:     # 4) OBSERVE + DECIDE — does anything meet every constraint?
+ 437:     # ------------------------------------------------------------------
+ 438:     catalog_matches = _match_products(query)
+ 439: 
+ 440:     def _build_cards(items, source_override=None):
+ 441:         cards = []
+ 442:         for item in items[:6]:
+ 443:             cards.append({
+ 444:                 "name": item.get("title") or item.get("name") or "Product",
+ 445:                 "category": item.get("source") or item.get("category") or "Web result",
+ 446:                 "price": item.get("price") or "",
+ 447:                 "sizes": item.get("sizes") or [],
+ 448:                 "in_stock": item.get("in_stock", True),
+ 449:                 "image": item.get("image") or item.get("thumbnail") or "",
+ 450:                 "link": item.get("link") or item.get("product_link") or "",
+ 451:                 "source": source_override or item.get("source") or "",
+ 452:                 "rating": item.get("rating") or "",
+ 453:                 "reviews": item.get("reviews") or "",
+ 454:                 "delivery": item.get("delivery") or "",
+ 455:             })
+ 456:         return cards
+ 457: 
+ 458:     products = _build_cards(live_products)
+ 459: 
+ 460:     # Local catalog is the "own store" — used for the inventory-reaction demo.
+ 461:     own_store = _build_cards(catalog_matches, source_override="Mika's Threads")
+ 462: 
+ 463:     # Decide whether to refine: nothing affordable, or no results at all.
+ 464:     refine_query = None
+ 465:     refine_reason = None
+ 466:     if not live_products:
+ 467:         refine_query = _groq([
+ 468:             {"role": "system", "content":
+ 469:              "Rewrite a shopper's search into a broader, simpler product query "
+ 470:              "(2-5 words) that will still match on Google Shopping. Reply with the query only."},
+ 471:             {"role": "user", "content": query},
+ 472:         ]).strip()
+ 473:         refine_reason = "No live results — broadening the search."
+ 474:     elif budget:
+ 475:         affordable = [p for p in products if _price_le(p.get("price", ""), budget)]
+ 476:         if not affordable and queries:
+ 477:             refine_query = f"cheap {category} under ${int(budget)}"
+ 478:             refine_reason = f"Nothing found under ${int(budget)} — refining."
+ 479: 
+ 480:     trace.append({
+ 481:         "step": "decide",
+ 482:         "label": "Evaluated the evidence",
+ 483:         "detail": refine_reason or "Found candidates that fit the request.",
+ 484:     })
+ 485: 
+ 486:     # ------------------------------------------------------------------
+ 487:     # 5) ACT AGAIN — one refinement pass if the critic demanded it
+ 488:     # ------------------------------------------------------------------
+ 489:     if refine_query and refine_query != query:
+ 490:         trace.append({
+ 491:             "step": "act_again",
+ 492:             "label": "Refining the search",
+ 493:             "detail": refine_query,
+ 494:         })
+ 495:         try:
+ 496:             more_products, more_sources = _run(refine_query)
+ 497:             live_products = deduped + more_products
+ 498:             live_sources = live_sources + more_sources
+ 499:             products = _build_cards(live_products)
+ 500:             for s in more_products:
+ 501:                 evidence.append({"q": refine_query, "title": s.get("title", ""),
+ 502:                                  "price": s.get("price", ""), "source": s.get("source", "")})
+ 503:         except Exception as e:
+ 504:             print("refine failed:", e)
+ 505: 
+ 506:     # ------------------------------------------------------------------
+ 507:     # 6) VERIFY — score each candidate against constraints, drop failures
+ 508:     # ------------------------------------------------------------------
+ 509:     verdict = _groq_json([
+ 510:         {"role": "system", "content":
+ 511:          "You are the verification stage of a shopping research agent. "
+ 512:          "Given the shopper's constraints and a list of candidates, pick the 3 best "
+ 513:          "and give each a 1-5 fit score with a one-line reason. "
+ 514:          "Return ONLY JSON: {\"picks\": [{\"name\": \"...\", \"score\": 4, \"reason\": \"...\"}], "
+ 515:          "\"verdict\": \"one short sentence\"}."},
+ 516:         {"role": "user", "content":
+ 517:          f"Constraints: {query}\nBudget max: {budget if budget else 'none'}\n"
+ 518:          f"Candidates:\n" + "\n".join(
+ 519:              f"- {p['name']} | {p.get('price') or 'price n/a'} | {p.get('source','')}"[:120]
+ 520:              for p in products[:8])},
+ 521:     ]) or {}
+ 522:     picks = verdict.get("picks") or []
+ 523:     if picks:
+ 524:         trace.append({
+ 525:             "step": "verify",
+ 526:             "label": "Verified against your needs",
+ 527:             "detail": verdict.get("verdict") or "Top picks scored.",
+ 528:         })
+ 529: 
+ 530:     # ------------------------------------------------------------------
+ 531:     # Build the final brief + sources
+ 532:     # ------------------------------------------------------------------
+ 533:     # Merge verification scores onto product cards so the frontend can show them.
+ 534:     score_by_name = {p.get("name", "").lower(): p for p in picks}
+ 535:     for p in products:
+ 536:         sc = score_by_name.get(p.get("name", "").lower())
+ 537:         if sc:
+ 538:             p["fit_score"] = sc.get("score")
+ 539:             p["fit_reason"] = sc.get("reason")
+ 540: 
+ 541:     sources = []
+ 542:     for s in (live_sources or [])[:6]:
+ 543:         if not s.get("title"):
+ 544:             continue
+ 545:         sources.append({
+ 546:             "title": s.get("title"),
+ 547:             "link": s.get("link", ""),
+ 548:             "snippet": s.get("snippet", ""),
+ 549:             "price": s.get("price", ""),
+ 550:         })
+ 551: 
+ 552:     # Inventory reaction (track example): if the store has a match but it's
+ 553:     # out of stock, recommend a live alternative instead.
+ 554:     out_of_stock = [p for p in own_store if not p.get("in_stock", True)]
+ 555:     inventory_note = ""
+ 556:     if out_of_stock and products:
+ 557:         alt = products[0].get("name", "a live alternative")
+ 558:         inventory_note = (f" Heads up: {out_of_stock[0]['name']} in your size is out of stock, "
+ 559:                           f"so I found {alt} instead.")
+ 560: 
+ 561:     context_lines = []
+ 562:     for p in products[:6]:
+ 563:         line = f"{p['name']}"
+ 564:         if p.get("price"):
+ 565:             line += f" — {p['price']}"
+ 566:         if p.get("source"):
+ 567:             line += f" ({p['source']})"
+ 568:         if p.get("rating"):
+ 569:             line += f", rating {p['rating']}"
+ 570:         if p.get("fit_score"):
+ 571:             line += f", fit {p['fit_score']}/5"
+ 572:         context_lines.append(line)
+ 573:     context = "\n".join(context_lines) if context_lines else "(no live results)"
+ 574: 
+ 575:     reply = None
+ 576:     try:
+ 577:         reply = _groq([
+ 578:             {"role": "system", "content":
+ 579:              "You are Clerk, an evidence-first shopping research agent. "
+ 580:              "Given the shopper's request and REAL live Google Shopping results, "
+ 581:              "write a concise 3-5 sentence buying brief naming the best options "
+ 582:              "and their real prices. Never invent prices — only cite what is given. "
+ 583:              "If nothing fits the budget, say so honestly."},
+ 584:             {"role": "user", "content":
+ 585:              f"Shopper request: {query}\n\nLive results:\n{context}\n\n"
+ 586:              f"Write the buying brief now." + inventory_note},
+ 587:         ], max_tokens=320)
+ 588:     except Exception as e:
+ 589:         reply = f"I couldn't complete the research. Error: {str(e)}"
+ 590:         print("Groq failed:", e)
+ 591: 
+ 592:     if not reply or len(reply) < 5:
+ 593:         if products:
+ 594:             reply = (f"Here are the strongest live matches for '{query}':\n"
+ 595:                      + "\n".join(f"• {p['name']} — {p.get('price','—')} ({p.get('source','')})"
+ 596:                                  for p in products[:3]))
+ 597:         else:
+ 598:             reply = f"I couldn't find live results for '{query}' right now."
+ 599: 
+ 600:     _log_insight({
+ 601:         "query": query,
+ 602:         "category": category,
+ 603:         "matched": len(products),
+ 604:         "products": [p.get("name") for p in products[:3]],
+ 605:         "live": bool(live_products),
+ 606:     })
+ 607: 
+ 608:     return {
+ 609:         "reply": reply,
+ 610:         "products": products,
+ 611:         "sources": sources,
+ 612:         "live": bool(live_products),
+ 613:         "trace": trace,
+ 614:         "evidence": evidence[:12],
+ 615:         "inventory_note": inventory_note,
+ 616:     }
+ 617: 
+ 618: 
+ 619: def _price_le(price_str, budget):
+ 620:     """True if a '$xx.xx' price string is at or under budget (best-effort)."""
+ 621:     try:
+ 622:         digits = "".join(ch for ch in str(price_str) if ch.isdigit() or ch == ".")
+ 623:         val = float(digits)
+ 624:         return val <= float(budget)
+ 625:     except (ValueError, TypeError):
+ 626:         return False
+ 627: 
+ 628: 
+ 629: @app.post("/api/search")
+ 630: def search(payload: dict = Body(...)):
+ 631:     """Raw live web price search."""
+ 632:     query = (payload.get("q") or payload.get("query") or "").strip()
+ 633:     if not query:
+ 634:         return JSONResponse({"error": "q is required"}, status_code=400)
+ 635:     try:
+ 636:         hits = _serp(query, num=8)
+ 637:         return {"query": query, "results": hits}
+ 638:     except Exception as e:
+ 639:         return JSONResponse({"error": f"search failed: {e}"}, status_code=500)
+ 640: 
+ 641: 
+ 642: # Serve the single-file frontend.
+ 643: app.mount("/", StaticFiles(directory=REPO_ROOT, html=True), name="frontend")
+ 644: 

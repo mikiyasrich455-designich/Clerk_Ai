@@ -1,0 +1,126 @@
+ 519:              f"- {p['name']} | {p.get('price') or 'price n/a'} | {p.get('source','')}"[:120]
+ 520:              for p in products[:8])},
+ 521:     ]) or {}
+ 522:     picks = verdict.get("picks") or []
+ 523:     if picks:
+ 524:         trace.append({
+ 525:             "step": "verify",
+ 526:             "label": "Verified against your needs",
+ 527:             "detail": verdict.get("verdict") or "Top picks scored.",
+ 528:         })
+ 529: 
+ 530:     # ------------------------------------------------------------------
+ 531:     # Build the final brief + sources
+ 532:     # ------------------------------------------------------------------
+ 533:     # Merge verification scores onto product cards so the frontend can show them.
+ 534:     score_by_name = {p.get("name", "").lower(): p for p in picks}
+ 535:     for p in products:
+ 536:         sc = score_by_name.get(p.get("name", "").lower())
+ 537:         if sc:
+ 538:             p["fit_score"] = sc.get("score")
+ 539:             p["fit_reason"] = sc.get("reason")
+ 540: 
+ 541:     sources = []
+ 542:     for s in (live_sources or [])[:6]:
+ 543:         if not s.get("title"):
+ 544:             continue
+ 545:         sources.append({
+ 546:             "title": s.get("title"),
+ 547:             "link": s.get("link", ""),
+ 548:             "snippet": s.get("snippet", ""),
+ 549:             "price": s.get("price", ""),
+ 550:         })
+ 551: 
+ 552:     # Inventory reaction (track example): if the store has a match but it's
+ 553:     # out of stock, recommend a live alternative instead.
+ 554:     out_of_stock = [p for p in own_store if not p.get("in_stock", True)]
+ 555:     inventory_note = ""
+ 556:     if out_of_stock and products:
+ 557:         alt = products[0].get("name", "a live alternative")
+ 558:         inventory_note = (f" Heads up: {out_of_stock[0]['name']} in your size is out of stock, "
+ 559:                           f"so I found {alt} instead.")
+ 560: 
+ 561:     context_lines = []
+ 562:     for p in products[:6]:
+ 563:         line = f"{p['name']}"
+ 564:         if p.get("price"):
+ 565:             line += f" — {p['price']}"
+ 566:         if p.get("source"):
+ 567:             line += f" ({p['source']})"
+ 568:         if p.get("rating"):
+ 569:             line += f", rating {p['rating']}"
+ 570:         if p.get("fit_score"):
+ 571:             line += f", fit {p['fit_score']}/5"
+ 572:         context_lines.append(line)
+ 573:     context = "\n".join(context_lines) if context_lines else "(no live results)"
+ 574: 
+ 575:     reply = None
+ 576:     try:
+ 577:         reply = _groq([
+ 578:             {"role": "system", "content":
+ 579:              "You are Clerk, an evidence-first shopping research agent. "
+ 580:              "Given the shopper's request and REAL live Google Shopping results, "
+ 581:              "write a concise 3-5 sentence buying brief naming the best options "
+ 582:              "and their real prices. Never invent prices — only cite what is given. "
+ 583:              "If nothing fits the budget, say so honestly."},
+ 584:             {"role": "user", "content":
+ 585:              f"Shopper request: {query}\n\nLive results:\n{context}\n\n"
+ 586:              f"Write the buying brief now." + inventory_note},
+ 587:         ], max_tokens=320)
+ 588:     except Exception as e:
+ 589:         reply = f"I couldn't complete the research. Error: {str(e)}"
+ 590:         print("Groq failed:", e)
+ 591: 
+ 592:     if not reply or len(reply) < 5:
+ 593:         if products:
+ 594:             reply = (f"Here are the strongest live matches for '{query}':\n"
+ 595:                      + "\n".join(f"• {p['name']} — {p.get('price','—')} ({p.get('source','')})"
+ 596:                                  for p in products[:3]))
+ 597:         else:
+ 598:             reply = f"I couldn't find live results for '{query}' right now."
+ 599: 
+ 600:     _log_insight({
+ 601:         "query": query,
+ 602:         "category": category,
+ 603:         "matched": len(products),
+ 604:         "products": [p.get("name") for p in products[:3]],
+ 605:         "live": bool(live_products),
+ 606:     })
+ 607: 
+ 608:     return {
+ 609:         "reply": reply,
+ 610:         "products": products,
+ 611:         "sources": sources,
+ 612:         "live": bool(live_products),
+ 613:         "trace": trace,
+ 614:         "evidence": evidence[:12],
+ 615:         "inventory_note": inventory_note,
+ 616:     }
+ 617: 
+ 618: 
+ 619: def _price_le(price_str, budget):
+ 620:     """True if a '$xx.xx' price string is at or under budget (best-effort)."""
+ 621:     try:
+ 622:         digits = "".join(ch for ch in str(price_str) if ch.isdigit() or ch == ".")
+ 623:         val = float(digits)
+ 624:         return val <= float(budget)
+ 625:     except (ValueError, TypeError):
+ 626:         return False
+ 627: 
+ 628: 
+ 629: @app.post("/api/search")
+ 630: def search(payload: dict = Body(...)):
+ 631:     """Raw live web price search."""
+ 632:     query = (payload.get("q") or payload.get("query") or "").strip()
+ 633:     if not query:
+ 634:         return JSONResponse({"error": "q is required"}, status_code=400)
+ 635:     try:
+ 636:         hits = _serp(query, num=8)
+ 637:         return {"query": query, "results": hits}
+ 638:     except Exception as e:
+ 639:         return JSONResponse({"error": f"search failed: {e}"}, status_code=500)
+ 640: 
+ 641: 
+ 642: # Serve the single-file frontend.
+ 643: app.mount("/", StaticFiles(directory=REPO_ROOT, html=True), name="frontend")
+ 644: 

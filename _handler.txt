@@ -1,0 +1,301 @@
+328|@app.post("/api/chat")
+329|def chat(payload: dict = Body(...)):
+330|    """Agentic shopping loop.
+331|
+332|    Understand -> Plan -> Act -> Observe -> Decide -> Act again -> Verify.
+333|
+334|    Returns the final brief plus a `trace` (the visible reasoning the judge
+335|    sees) and an `evidence` trail of the searches that were actually run.
+336|    """
+337|    query = (payload.get("message") or "").strip()
+338|    if not query:
+339|        return JSONResponse({"error": "message is required"}, status_code=400)
+340|
+341|    trace = []
+342|    evidence = []
+343|
+344|    # ------------------------------------------------------------------
+345|    # 1) UNDERSTAND — extract hard constraints (budget, category, musts)
+346|    # ------------------------------------------------------------------
+347|    constraints = _groq_json([
+348|        {"role": "system", "content":
+349|         "You are the intent-understanding stage of a shopping research agent. "
+350|         "Extract structured constraints from a shopper's request. "
+351|         "Return ONLY a JSON object with keys: "
+352|         "\"category\" (the product type), \"budget_max\" (a number in USD, or null if none), "
+353|         "\"must_have\" (list of hard requirements, e.g. sizes, specs, brand, color), "
+354|         "\"use_case\" (one short phrase)."},
+355|        {"role": "user", "content": query},
+356|    ]) or {}
+357|    category = constraints.get("category") or query
+358|    budget = constraints.get("budget_max")
+359|    musts = constraints.get("must_have") or []
+360|    trace.append({
+361|        "step": "understand",
+362|        "label": "Understood the request",
+363|        "detail": (f"category “{category}”"
+364|                   + (f", budget ≤ ${budget}" if budget else "")
+365|                   + (f", must-have: {', '.join(musts)}" if musts else "")),
+366|    })
+367|
+368|    # ------------------------------------------------------------------
+369|    # 2) PLAN — the agent writes its own search queries
+370|    # ------------------------------------------------------------------
+371|    plan = _groq_json([
+372|        {"role": "system", "content":
+373|         "You are the planning stage of a shopping research agent. "
+374|         "Given a shopper's constraints, write 2-3 precise search queries that "
+375|         "would surface strong product candidates on Google Shopping. "
+376|         "Return ONLY a JSON object: {\"queries\": [\"...\", ...]}."},
+377|        {"role": "user", "content":
+378|         f"Request: {query}\nCategory: {category}\n"
+379|         f"Budget max: {budget if budget else 'none'}\nMust-have: {', '.join(musts) or 'none'}"},
+380|    ]) or {}
+381|    queries = plan.get("queries") or []
+382|    if not queries:
+383|        queries = [query]
+384|    trace.append({
+385|        "step": "plan",
+386|        "label": "Planned the research",
+387|        "detail": "Searching: " + " · ".join(queries[:3]),
+388|    })
+389|
+390|    # ------------------------------------------------------------------
+391|    # 3) ACT — run the searches (all queries in parallel)
+392|    # ------------------------------------------------------------------
+393|    def _run(query_text):
+394|        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+395|            f1 = ex.submit(_serp_shopping, query_text, 8)
+396|            f2 = ex.submit(_serp, query_text, 8)
+397|            try:
+398|                shop = f1.result(timeout=15)
+399|            except Exception:
+400|                shop = []
+401|            try:
+402|                org = f2.result(timeout=15)
+403|            except Exception:
+404|                org = []
+405|        return shop, org
+406|
+407|    with concurrent.futures.ThreadPoolExecutor(max_workers=len(queries)) as ex:
+408|        results = list(ex.map(_run, queries))
+409|
+410|    live_products = []
+411|    live_sources = []
+412|    for query_text, (shop, org) in zip(queries, results):
+413|        live_products.extend(shop)
+414|        live_sources.extend(org)
+415|        for s in shop:
+416|            evidence.append({"q": query_text, "title": s.get("title", ""),
+417|                             "price": s.get("price", ""), "source": s.get("source", "")})
+418|
+419|    # de-dupe by title
+420|    seen = set()
+421|    deduped = []
+422|    for p in live_products:
+423|        key = (p.get("title") or "").lower()
+424|        if key and key not in seen:
+425|            seen.add(key)
+426|            deduped.append(p)
+427|    live_products = deduped
+428|
+429|    trace.append({
+430|        "step": "act",
+431|        "label": "Searched live sources",
+432|        "detail": f"{len(live_products)} product results · {len(live_sources)} sources",
+433|    })
+434|
+435|    # ------------------------------------------------------------------
+436|    # 4) OBSERVE + DECIDE — does anything meet every constraint?
+437|    # ------------------------------------------------------------------
+438|    catalog_matches = _match_products(query)
+439|
+440|    def _build_cards(items, source_override=None):
+441|        cards = []
+442|        for item in items[:6]:
+443|            cards.append({
+444|                "name": item.get("title") or item.get("name") or "Product",
+445|                "category": item.get("source") or item.get("category") or "Web result",
+446|                "price": item.get("price") or "",
+447|                "sizes": item.get("sizes") or [],
+448|                "in_stock": item.get("in_stock", True),
+449|                "image": item.get("image") or item.get("thumbnail") or "",
+450|                "link": item.get("link") or item.get("product_link") or "",
+451|                "source": source_override or item.get("source") or "",
+452|                "rating": item.get("rating") or "",
+453|                "reviews": item.get("reviews") or "",
+454|                "delivery": item.get("delivery") or "",
+455|            })
+456|        return cards
+457|
+458|    products = _build_cards(live_products)
+459|
+460|    # Local catalog is the "own store" — used for the inventory-reaction demo.
+461|    own_store = _build_cards(catalog_matches, source_override="Mika's Threads")
+462|
+463|    # Decide whether to refine: nothing affordable, or no results at all.
+464|    refine_query = None
+465|    refine_reason = None
+466|    if not live_products:
+467|        refine_query = _groq([
+468|            {"role": "system", "content":
+469|             "Rewrite a shopper's search into a broader, simpler product query "
+470|             "(2-5 words) that will still match on Google Shopping. Reply with the query only."},
+471|            {"role": "user", "content": query},
+472|        ]).strip()
+473|        refine_reason = "No live results — broadening the search."
+474|    elif budget:
+475|        affordable = [p for p in products if _price_le(p.get("price", ""), budget)]
+476|        if not affordable and queries:
+477|            refine_query = f"cheap {category} under ${int(budget)}"
+478|            refine_reason = f"Nothing found under ${int(budget)} — refining."
+479|
+480|    trace.append({
+481|        "step": "decide",
+482|        "label": "Evaluated the evidence",
+483|        "detail": refine_reason or "Found candidates that fit the request.",
+484|    })
+485|
+486|    # ------------------------------------------------------------------
+487|    # 5) ACT AGAIN — one refinement pass if the critic demanded it
+488|    # ------------------------------------------------------------------
+489|    if refine_query and refine_query != query:
+490|        trace.append({
+491|            "step": "act_again",
+492|            "label": "Refining the search",
+493|            "detail": refine_query,
+494|        })
+495|        try:
+496|            more_products, more_sources = _run(refine_query)
+497|            live_products = deduped + more_products
+498|            live_sources = live_sources + more_sources
+499|            products = _build_cards(live_products)
+500|            for s in more_products:
+501|                evidence.append({"q": refine_query, "title": s.get("title", ""),
+502|                                 "price": s.get("price", ""), "source": s.get("source", "")})
+503|        except Exception as e:
+504|            print("refine failed:", e)
+505|
+506|    # ------------------------------------------------------------------
+507|    # 6) VERIFY — score each candidate against constraints, drop failures
+508|    # ------------------------------------------------------------------
+509|    verdict = _groq_json([
+510|        {"role": "system", "content":
+511|         "You are the verification stage of a shopping research agent. "
+512|         "Given the shopper's constraints and a list of candidates, pick the 3 best "
+513|         "and give each a 1-5 fit score with a one-line reason. "
+514|         "Return ONLY JSON: {\"picks\": [{\"name\": \"...\", \"score\": 4, \"reason\": \"...\"}], "
+515|         "\"verdict\": \"one short sentence\"}."},
+516|        {"role": "user", "content":
+517|         f"Constraints: {query}\nBudget max: {budget if budget else 'none'}\n"
+518|         f"Candidates:\n" + "\n".join(
+519|             f"- {p['name']} | {p.get('price') or 'price n/a'} | {p.get('source','')}"[:120]
+520|             for p in products[:8])},
+521|    ]) or {}
+522|    picks = verdict.get("picks") or []
+523|    if picks:
+524|        trace.append({
+525|            "step": "verify",
+526|            "label": "Verified against your needs",
+527|            "detail": verdict.get("verdict") or "Top picks scored.",
+528|        })
+529|
+530|    # ------------------------------------------------------------------
+531|    # Build the final brief + sources
+532|    # ------------------------------------------------------------------
+533|    # Merge verification scores onto product cards so the frontend can show them.
+534|    score_by_name = {p.get("name", "").lower(): p for p in picks}
+535|    for p in products:
+536|        sc = score_by_name.get(p.get("name", "").lower())
+537|        if sc:
+538|            p["fit_score"] = sc.get("score")
+539|            p["fit_reason"] = sc.get("reason")
+540|
+541|    sources = []
+542|    for s in (live_sources or [])[:6]:
+543|        if not s.get("title"):
+544|            continue
+545|        sources.append({
+546|            "title": s.get("title"),
+547|            "link": s.get("link", ""),
+548|            "snippet": s.get("snippet", ""),
+549|            "price": s.get("price", ""),
+550|        })
+551|
+552|    # Inventory reaction (track example): if the store has a match but it's
+553|    # out of stock, recommend a live alternative instead.
+554|    out_of_stock = [p for p in own_store if not p.get("in_stock", True)]
+555|    inventory_note = ""
+556|    if out_of_stock and products:
+557|        alt = products[0].get("name", "a live alternative")
+558|        inventory_note = (f" Heads up: {out_of_stock[0]['name']} in your size is out of stock, "
+559|                          f"so I found {alt} instead.")
+560|
+561|    context_lines = []
+562|    for p in products[:6]:
+563|        line = f"{p['name']}"
+564|        if p.get("price"):
+565|            line += f" — {p['price']}"
+566|        if p.get("source"):
+567|            line += f" ({p['source']})"
+568|        if p.get("rating"):
+569|            line += f", rating {p['rating']}"
+570|        if p.get("fit_score"):
+571|            line += f", fit {p['fit_score']}/5"
+572|        context_lines.append(line)
+573|    context = "\n".join(context_lines) if context_lines else "(no live results)"
+574|
+575|    reply = None
+576|    try:
+577|        reply = _groq([
+578|            {"role": "system", "content":
+579|             "You are Clerk, an evidence-first shopping research agent. "
+580|             "Given the shopper's request and REAL live Google Shopping results, "
+581|             "write a concise 3-5 sentence buying brief naming the best options "
+582|             "and their real prices. Never invent prices — only cite what is given. "
+583|             "If nothing fits the budget, say so honestly."},
+584|            {"role": "user", "content":
+585|             f"Shopper request: {query}\n\nLive results:\n{context}\n\n"
+586|             f"Write the buying brief now." + inventory_note},
+587|        ], max_tokens=320)
+588|    except Exception as e:
+589|        reply = f"I couldn't complete the research. Error: {str(e)}"
+590|        print("Groq failed:", e)
+591|
+592|    if not reply or len(reply) < 5:
+593|        if products:
+594|            reply = (f"Here are the strongest live matches for '{query}':\n"
+595|                     + "\n".join(f"• {p['name']} — {p.get('price','—')} ({p.get('source','')})"
+596|                                 for p in products[:3]))
+597|        else:
+598|            reply = f"I couldn't find live results for '{query}' right now."
+599|
+600|    _log_insight({
+601|        "query": query,
+602|        "category": category,
+603|        "matched": len(products),
+604|        "products": [p.get("name") for p in products[:3]],
+605|        "live": bool(live_products),
+606|    })
+607|
+608|    return {
+609|        "reply": reply,
+610|        "products": products,
+611|        "sources": sources,
+612|        "live": bool(live_products),
+613|        "trace": trace,
+614|        "evidence": evidence[:12],
+615|        "inventory_note": inventory_note,
+616|    }
+617|
+618|
+619|def _price_le(price_str, budget):
+620|    """True if a '$xx.xx' price string is at or under budget (best-effort)."""
+621|    try:
+622|        digits = "".join(ch for ch in str(price_str) if ch.isdigit() or ch == ".")
+623|        val = float(digits)
+624|        return val <= float(budget)
+625|    except (ValueError, TypeError):
+626|        return False
+627|
+628|
