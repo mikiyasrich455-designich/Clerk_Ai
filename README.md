@@ -2,8 +2,7 @@ Live Hosted on https://clerkagentv1.vercel.app/
   
   **LIVE COMMERCE RESEARCH AGENT**
   
-  [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/mikiyasrich455-designich/clerkagentv1)
-</div>
+  
 
 ## 🛒 The Problem: Product Noise
 Online shopping is broken. Finding the right product requires opening twenty tabs, dodging sponsored junk, reading questionable reviews, and mentally tracking prices across different sites. It’s a manual, exhausting research process that hasn't changed in a decade.
