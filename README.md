@@ -1,7 +1,4 @@
-<div align="center">
-  <img src="./hero.png" alt="Clerk - Shop with proof, not product noise." width="100%" />
-  
-  <br/>
+Live Hosted on https://clerkagentv1.vercel.app/
   
   **LIVE COMMERCE RESEARCH AGENT**
   
